@@ -78,6 +78,10 @@ def load_precipitation_data(city_name="Jakarta", years=10):
 
 
 def load_from_json(json_path):
+    """Load precipitation (and optional weather) data from JSON.
+    Supports both legacy schema (just dates+precip_mm) and extended schema
+    (with humidity_mm, pressure_kPa, windspeed_ms, temperature_c, etc.).
+    """
     import json
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -85,6 +89,23 @@ def load_from_json(json_path):
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.set_index('Date').asfreq('D').interpolate(method='linear').dropna()
     city = data.get('city', json_path)
+    # Load optional exogenous weather columns if present
+    for col_map in [
+        ('humidity', 'humidity'),       # RH2M %
+        ('rh2m', 'humidity'),           # NASA POWER code
+        ('pressure', 'pressure'),       # PS kPa
+        ('ps', 'pressure'),             # NASA POWER code
+        ('windspeed', 'windspeed'),     # WS10M m/s
+        ('ws10m', 'windspeed'),         # NASA POWER code
+        ('temperature', 'temperature'), # T2M C
+        ('t2m', 'temperature'),         # NASA POWER code
+        ('wind_direction', 'wind_dir'), # WD10M degrees
+    ]:
+        key, target = col_map
+        if key in data:
+            vals = data[key]
+            if len(vals) == len(df):
+                df[target] = vals
     print(f'  Loaded {len(df)} days from {json_path} (city: {city})')
     return df, city
 
