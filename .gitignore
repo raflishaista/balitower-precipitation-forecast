@@ -25,6 +25,7 @@ env/
 
 # Optional: serialized model artifacts (large files)
 .data/processed/
+data/processed/
 data/processed/*.joblib
 data/processed/*.pkl
 data/processed/precipitation_model.joblib
