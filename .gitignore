@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs & caches
+*.log
+.cache/
+.ipynb_checkpoints/
+
+# Optional: serialized model artifacts (large files)
+# data/processed/*.joblib
+# data/processed/*.pkl
+
+# Optional: generated outputs (commented out by default — outputs ARE committed in this repo)
+# outputs/figures/*.png
+# outputs/predictions/*.json

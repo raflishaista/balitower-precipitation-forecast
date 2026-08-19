@@ -1,0 +1,27 @@
+# Core & Data Processing
+numpy>=1.26.0
+pandas>=2.0.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+openpyxl>=3.1.0
+joblib>=1.3.0
+requests>=2.31.0
+
+# Time Series & Forecasting Models
+statsmodels>=0.14.0
+xgboost>=2.0.0
+
+# Deep Learning (optional — only required for LSTM in precipitation_forecast)
+tensorflow>=2.15.0
+
+# Plotting
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Jupyter (for notebooks/)
+ipykernel>=6.29.0
+jupyter>=1.0.0
+notebook>=7.1.0
+
+# ConvGRU ensemble for radar nowcasting (HuggingFace)
+# pip install convgru-ensemble   # see models/irene.py
