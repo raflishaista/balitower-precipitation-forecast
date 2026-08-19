@@ -269,25 +269,26 @@ def main():
     # Export each city as JSON for use by precipitation_forecast.py
     import json
     os.makedirs("inputs_json", exist_ok=True)
+    # NASA POWER code -> friendly name mapping
+    NAASA_POWER_TO_JSON = {
+        "PRECTOTCORR": "precip_mm",
+        "RH2M": "humidity",
+        "PS": "pressure",
+        "WS10M": "windspeed",
+        "T2M": "temperature",
+        "WD10M": "wind_direction",
+    }
     for name, df in all_dfs.items():
         safe = name.replace(" ", "_")
-        out = {
-            "city": name,
-            "lat": None, "lon": None,
-            "years": years,
-            "dates": df["Date"].dt.strftime("%Y-%m-%d").tolist(),
-            "precip_mm": df["Precipitation"].round(4).tolist(),
-        }
-        # Add optional exogenous weather columns if present
-        col_map = [
-            ("Humidity", "humidity"),
-            ("Pressure", "pressure"),
-            ("Wind Speed", "windspeed"),
-            ("Temperature", "temperature"),
-        ]
-        for excel_col, json_key in col_map:
-            if excel_col in df.columns:
-                out[json_key] = df[excel_col].round(4).tolist()
+        out = {"city": name, "lat": None, "lon": None, "years": years, "dates": []}
+        for _, row in df.iterrows():
+            date_str = row["Date"].strftime("%Y-%m-%d")
+            out["dates"].append(date_str)
+            for code, key in NAASA_POWER_TO_JSON.items():
+                if code in row and row[code] is not None:
+                    if key not in out:
+                        out[key] = []
+                    out[key].append(round(float(row[code]), 4))
         with open(f"inputs_json/{safe}_precip.json", "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
         print(f"  [Saved] inputs_json/{safe}_precip.json")
