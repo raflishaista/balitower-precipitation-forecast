@@ -24,6 +24,8 @@ env/
 .ipynb_checkpoints/
 
 # Optional: serialized model artifacts (large files)
+.data/
+data/
 .data/processed/
 data/processed/
 data/processed/*.joblib

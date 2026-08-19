@@ -128,18 +128,53 @@ def save_forecast_to_json(city, forecast_dates, sarima_fc, xgb_fc, sarima_ci,
 
 
 def build_features(df, lags=(1, 2, 3, 7, 14, 30), windows=(7, 14, 30)):
+    """Build feature matrix from precipitation + optional exogenous weather columns.
+
+    Available exogenous columns (auto-detected if present):
+      - humidity   : relative humidity % (RH2M)
+      - pressure   : surface pressure kPa (PS)
+      - windspeed  : 10m wind speed m/s (WS10M)
+      - temperature: 2m temperature C (T2M)
+      - wind_dir   : wind direction degrees (WD10M)
+    """
     df = df.copy()
     df["day_of_year"] = df.index.dayofyear
     df["month"] = df.index.month
     df["year"] = df.index.year
     df["doy_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
     df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
+    # Precipitation history features
     for lag in lags:
         df[f"lag_{lag}"] = df["precip"].shift(lag)
     for w in windows:
         df[f"roll_mean_{w}"] = df["precip"].shift(1).rolling(w, min_periods=1).mean()
         df[f"roll_std_{w}"] = df["precip"].shift(1).rolling(w, min_periods=1).std()
         df[f"roll_min_{w}"] = df["precip"].shift(1).rolling(w, min_periods=1).min()
+    # Exogenous weather features (if available)
+    _EXOG_MAP = {
+        "humidity": None,      # RH2M %
+        "pressure": None,      # PS kPa
+        "windspeed": None,     # WS10M m/s
+        "temperature": None,   # T2M C
+        "wind_dir": None,      # WD10M degrees
+    }
+    # Find which exogenous columns exist in the data
+    available_exog = [col for col in _EXOG_MAP if col in df.columns]
+    if available_exog:
+        # Lagged exogenous features (lag 1 and 7)
+        for col in available_exog:
+            for lag in (1, 7):
+                df[f"{col}_lag{lag}"] = df[col].shift(lag)
+        # Derived interaction features
+        if "humidity" in available_exog and "temperature" in available_exog:
+            df["temp_humid_product"] = df["temperature"] * df["humidity"] / 100
+        if "pressure" in available_exog:
+            df["pressure_trend"] = df["pressure"] - df["pressure"].shift(1)
+        if "humidity" in available_exog:
+            df["humidity_trend"] = df["humidity"] - df["humidity"].shift(1)
+        if "wind_dir" in available_exog:
+            df["wind_dir_sin"] = np.sin(2 * np.pi * df["wind_dir"] / 360)
+            df["wind_dir_cos"] = np.cos(2 * np.pi * df["wind_dir"] / 360)
     df = df.dropna().reset_index(drop=True)
     return df
 
@@ -151,18 +186,32 @@ def split_train_test(df, split=TRAIN_SPLIT):
 
 # -- SARIMAX -------------------------------------------------------------------
 
+def _sarima_exog_cols(df):
+    """Return list of exogenous column names for SARIMAX, ordered consistently."""
+    cols = ["doy_sin", "doy_cos"]
+    _EXOG_ORDER = ["humidity_lag1", "humidity_lag7", "pressure_lag1", "pressure_lag7",
+                   "windspeed_lag1", "windspeed_lag7", "temperature_lag1", "temperature_lag7",
+                   "temp_humid_product", "pressure_trend", "humidity_trend",
+                   "wind_dir_sin", "wind_dir_cos"]
+    cols += [c for c in _EXOG_ORDER if c in df.columns]
+    return cols
+
+
 def sarima_fit(train_df):
     endog = train_df["precip"]
-    exog = train_df[["doy_sin", "doy_cos"]].values
+    exog_cols = _sarima_exog_cols(train_df)
+    exog = train_df[exog_cols].values if exog_cols else None
     model = SARIMAX(endog, order=(1, 0, 1), seasonal_order=(0, 1, 1, 7),
                     exogenous=exog, enforce_stationarity=False,
                     enforce_invertibility=False)
     results = model.fit(disp=False, maxiter=100, method="lbfgs")
+    results._exog_cols = exog_cols  # store for later use
     return results
 
 
 def sarima_test_predictions(results, test_df):
-    test_exog = test_df[["doy_sin", "doy_cos"]].values
+    exog_cols = getattr(results, '_exog_cols', ["doy_sin", "doy_cos"])
+    test_exog = test_df[exog_cols].values if exog_cols else None
     pred = results.get_forecast(steps=len(test_df), exog=test_exog)
     preds = pred.predicted_mean.values
     preds = np.maximum(preds, 0)
@@ -170,7 +219,8 @@ def sarima_test_predictions(results, test_df):
 
 
 def sarima_forward_forecast(results, feat_df, horizon=FORECAST_HORIZON):
-    exog_tail = feat_df[["doy_sin", "doy_cos"]].tail(horizon).values
+    exog_cols = getattr(results, '_exog_cols', ["doy_sin", "doy_cos"])
+    exog_tail = feat_df[exog_cols].tail(horizon).values if exog_cols else None
     pred = results.get_forecast(steps=horizon, exog=exog_tail)
     preds = pred.predicted_mean.values
     preds = np.maximum(preds, 0)
