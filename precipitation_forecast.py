@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -86,6 +87,37 @@ def load_precipitation_data(city_name="Jakarta", years=10):
     df = df.set_index("date").resample("D").sum().interpolate(method="linear").dropna()
     print(f"  Fetched {len(df)} days from NASA POWER for {name}")
     return df, None
+
+
+
+def load_from_json(json_path):
+    """Load precipitation data from weather.py JSON output (inputs_Json/)."""
+    import json
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    df = pd.DataFrame({'Date': data['dates'], 'precip': data['precip_mm']})
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.set_index('Date').asfreq('D').interpolate(method='linear').dropna()
+    city = data.get('city', json_path)
+    print(f'  Loaded {len(df)} days from {json_path} (city: {city})')
+    return df, city
+
+def save_forecast_to_json(city, forecast_dates, sarima_fc, xgb_fc, sarima_ci,
+                          metrics, output_path):
+    """Save forecast results to JSON (outputs_Json/)."""
+    import json
+    result = {
+        'city': city,
+        'forecast_dates': [d.strftime('%Y-%m-%d') for d in forecast_dates],
+        'sarimax_forecast': [round(float(v), 2) for v in sarima_fc],
+        'sarimax_ci_lower': [round(float(v), 2) for v in sarima_ci[:, 0]],
+        'sarimax_ci_upper': [round(float(v), 2) for v in sarima_ci[:, 1]],
+        'xgboost_forecast': [round(float(v), 2) for v in xgb_fc],
+        'test_metrics': metrics,
+    }
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2)
+    print(f'  [Saved] {output_path}')
 
 
 def build_features(df, lags=(1, 2, 3, 7, 14, 30), windows=(7, 14, 30)):
@@ -233,7 +265,7 @@ def evaluate(y_true, y_pred, name):
 
 # -- main pipeline -------------------------------------------------------------
 
-def run(city, years, include_lstm=True):
+def run(city, years, include_lstm=True, save_json_path=None):
     print(f"\n{'='*60}")
     print(f"  PRECIPITATION FORECAST — {city.upper()}")
     print(f"  {years} years of daily data  |  Horizon: {FORECAST_HORIZON} days")
@@ -388,6 +420,8 @@ def main():
     parser.add_argument("--years", type=int, default=10, help="Years of historical data (default: 10)")
     parser.add_argument("--file", default=None, help="Path to existing Excel file (overrides --city)")
     parser.add_argument("--col", default=None, help="Column name in Excel (default: auto-detect)")
+    parser.add_argument("--input", default=None, help="Path to inputs_Json/*.json (overrides --city)")
+    parser.add_argument("--output", default=None, help="Output path for forecast JSON (default: outputs_Json/forecast_{city}.json)")
     parser.add_argument("--no-lstm", action="store_true", help="Skip LSTM model")
     args = parser.parse_args()
 
@@ -428,6 +462,43 @@ def main():
         print(f"[Saved] {MODEL_PATH}")
         return
 
+    if args.input:
+        df, city_name = load_from_json(args.input)
+        if df is None:
+            sys.exit(1)
+        feat_df = build_features(df)
+        train_df, test_df = split_train_test(feat_df)
+        print()
+        print("=" * 60)
+        print(f"  PRECIPITATION FORECAST - {city_name.upper()}")
+        print(f"  {len(train_df)+len(test_df)} days | Train: {len(train_df)} | Test: {len(test_df)}")
+        print()
+        sarima_res = sarima_fit(train_df)
+        sarima_pred, sarima_test_ci = sarima_test_predictions(sarima_res, test_df)
+        sarima_metrics = evaluate(test_df["precip"].values, sarima_pred, "SARIMAX")
+        xgb_model, feat_cols = train_xgboost(train_df)
+        xgb_pred = np.maximum(xgb_model.predict(test_df[feat_cols].values), 0)
+        xgb_metrics = evaluate(test_df["precip"].values, xgb_pred, "XGBoost")
+        print(f"  SARIMAX: {sarima_metrics}")
+        print(f"  XGBoost: {xgb_metrics}")
+        forecast_dates = pd.date_range(start=df.index[-1] + timedelta(days=1),
+                                       periods=FORECAST_HORIZON, freq="D")
+        sarima_fc, sarima_ci = sarima_forward_forecast(sarima_res, feat_df, FORECAST_HORIZON)
+        xgb_fc = np.maximum(xgb_model.predict(feat_df[feat_cols].tail(FORECAST_HORIZON).values), 0)
+        fc = pd.DataFrame({"Date": forecast_dates, "SARIMAX": np.round(sarima_fc, 2),
+                           "XGBoost": np.round(xgb_fc, 2)})
+        fc_low = np.round(sarima_ci[:, 0], 2)
+        fc_high = np.round(sarima_ci[:, 1], 2)
+        fc["SARIMAX_Lo95"] = fc_low
+        fc["SARIMAX_Hi95"] = fc_high
+        print()
+        print("--- 7-Day Precipitation Forecast ---")
+        print()
+        print(fc.to_string(index=False))
+        save_forecast_to_json(city_name, forecast_dates, sarima_fc, xgb_fc, sarima_ci,
+                              [sarima_metrics, xgb_metrics],
+                              args.output or f"outputs_Json/forecast_{city_name.replace(chr(32), chr(95))}.json")
+        return
     run(args.city, args.years, include_lstm=not args.no_lstm)
 
 
