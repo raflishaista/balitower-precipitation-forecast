@@ -24,8 +24,8 @@ env/
 .ipynb_checkpoints/
 
 # Optional: serialized model artifacts (large files)
-# data/processed/*.joblib
-# data/processed/*.pkl
+data/processed/*.joblib
+data/processed/*.pkl
 
 # Optional: generated outputs (commented out by default — outputs ARE committed in this repo)
 # outputs/figures/*.png
