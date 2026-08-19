@@ -5,3 +5,6 @@
   precipitation_models — SARIMAX / XGBoost / LSTM forecasters (used by run_forecast.py)
   plotting           — matplotlib plotting routines for forecast comparison figures
 """
+from .precipitation_models import backtest_last_n_days
+
+from .plotting import plot_backtest

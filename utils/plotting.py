@@ -85,3 +85,67 @@ def plot_forecast(figsize=(14, 9), save_path="outputs/figures/precipitation_fore
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  [Saved] {save_path}")
+
+
+def plot_backtest(backtest_result, save_path="outputs/figures/backtest_last7days.png"):
+    """Plot walk-forward backtest: model predictions vs actual for the last *n* days.
+
+    The model was trained on all data *before* the backtest window (no future leakage).
+    This simulates a real 7-day-ahead forecast that has now been verified against observed data.
+    """
+    import json
+    dates = backtest_result["dates"]
+    actual = backtest_result["actual"]
+    sarima_pred = backtest_result["sarima_pred"]
+    sarima_ci = backtest_result["sarima_ci"]
+    xgb_pred = backtest_result["xgb_pred"]
+    sarima_metrics = backtest_result["sarima_metrics"]
+    xgb_metrics = backtest_result["xgb_metrics"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Line plot: actual vs predictions ---
+    ax1 = axes[0]
+    x = np.arange(len(dates))
+    ax1.plot(x, actual, "ko-", markersize=8, label="Actual", zorder=5)
+    ax1.plot(x, sarima_pred, "b^--", markersize=8, label=f"SARIMAX (RMSE={sarima_metrics['RMSE']:.1f})")
+    ax1.plot(x, xgb_pred, "s--", markersize=8,
+             label=f"XGBoost (RMSE={xgb_metrics['RMSE']:.1f})")
+    ax1.fill_between(x, sarima_ci[:, 0], sarima_ci[:, 1],
+                     color="blue", alpha=0.1, label="SARIMAX 95% CI")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([d.strftime("%m/%d") for d in dates], rotation=45)
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Precipitation (mm)")
+    ax1.set_title("Walk-Forward Backtest — Last 7 Days")
+    ax1.legend(fontsize=8)
+    ax1.axhline(0, color="grey", linewidth=0.5)
+
+    # --- Bar chart: prediction error breakdown ---
+    ax2 = axes[1]
+    colors = ["steelblue", "darkorange"]
+    for i, (pred, name, met) in enumerate([
+        (sarima_pred, "SARIMAX", sarima_metrics),
+        (xgb_pred, "XGBoost", xgb_metrics),
+    ]):
+        # Bar shows mean prediction error (predicted - actual)
+        mean_err = pred.mean() - actual.mean()
+        ax2.bar(i, mean_err, color=colors[i], alpha=0.8,
+                label=f"{name} (MAE={met['MAE']:.2f})")
+    ax2.set_xticks([0, 1])
+    ax2.set_xticklabels(["SARIMAX", "XGBoost"])
+    ax2.set_xlabel("Model")
+    ax2.set_ylabel("Mean Prediction Error (mm)\n(mean predicted − mean actual)")
+    ax2.set_title("Backtest Error Comparison")
+    ax2.legend(fontsize=8)
+    ax2.axhline(0, color="grey", linewidth=0.5)
+    # Annotate each bar with the signed error
+    for i, (pred, met) in enumerate([(sarima_pred, sarima_metrics), (xgb_pred, xgb_metrics)]):
+        err = pred.mean() - actual.mean()
+        ax2.text(i, err + (1.5 if err >= 0 else -3),
+                 f"err: {err:.1f}", ha="center", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [Saved] {save_path}")

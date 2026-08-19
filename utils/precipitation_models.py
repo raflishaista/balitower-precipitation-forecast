@@ -81,13 +81,19 @@ def load_from_json(json_path):
     """Load precipitation (and optional weather) data from JSON.
     Supports both legacy schema (just dates+precip_mm) and extended schema
     (with humidity_mm, pressure_kPa, windspeed_ms, temperature_c, etc.).
+    Trims trailing -999 (NASA POWER missing) values from ALL columns.
     """
     import json
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     df = pd.DataFrame({'Date': data['dates'], 'precip': data['precip_mm']})
     df['Date'] = pd.to_datetime(df['Date'])
-    df = df.set_index('Date').asfreq('D').interpolate(method='linear').dropna()
+    df = df.set_index('Date').asfreq('D')
+    # Replace NASA POWER missing-value sentinel (-999) with NaN
+    df = df.replace(-999.0, np.nan)
+    # Trim trailing NaN rows BEFORE loading exogenous columns (arrays may differ in length)
+    df = df.dropna(how='all')
+    valid_len = len(df)
     city = data.get('city', json_path)
     # Load optional exogenous weather columns if present
     for col_map in [
@@ -104,8 +110,14 @@ def load_from_json(json_path):
         key, target = col_map
         if key in data:
             vals = data[key]
-            if len(vals) == len(df):
-                df[target] = vals
+            # Trim to valid_len so it aligns with df after trailing-NaN removal
+            vals = vals[:valid_len]
+            df[target] = vals
+    # Now replace any remaining -999 in exogenous cols with NaN and interpolate
+    exog_cols = [c for c in df.columns if c not in ('precip',)]
+    df = df.replace(-999.0, np.nan)
+    df[exog_cols] = df[exog_cols].interpolate(method='linear')
+    df = df.dropna()
     print(f'  Loaded {len(df)} days from {json_path} (city: {city})')
     return df, city
 
@@ -296,12 +308,266 @@ def forecast_lstm(model, full_series, scaler, horizon=FORECAST_HORIZON):
     return scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
 
 
+# -- HistGradientBoosting (sklearn, no install needed) --------------------------
+
+def train_histgb(train_df):
+    """Train HistGradientBoostingRegressor on feature columns."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    feature_cols = [c for c in train_df.columns if c not in ("precip", "day_of_year", "month", "year")]
+    X, y = train_df[feature_cols].values, train_df["precip"].values
+    model = HistGradientBoostingRegressor(
+        max_iter=200, max_depth=6, learning_rate=0.05,
+        random_state=42, early_stopping=True, validation_fraction=0.1,
+        n_iter_no_change=10, min_samples_leaf=5,
+    )
+    model.fit(X, y)
+    return model, feature_cols
+
+
+def forecast_histgb(model, feature_cols, test_df):
+    preds = np.maximum(model.predict(test_df[feature_cols].values), 0)
+    return preds
+
+
+# -- ETS / Holt-Winters (statsmodels, no install needed) -----------------------
+
+def ets_fit(train_df):
+    """Fit Holt-Winters Exponential Smoothing with additive trend & multiplicative seasonality."""
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    endog = train_df["precip"]
+    # Additive trend, multiplicative seasonal (handles zero/near-zero values safely with additive)
+    model = ExponentialSmoothing(
+        endog,
+        trend="add",
+        seasonal="add",
+        seasonal_periods=7,
+        initialization_method="estimated",
+    )
+    results = model.fit(optimized=True, use_brute=True)
+    return results
+
+
+def ets_test_predictions(results, test_df):
+    """ETS Forecast using Holt-Winters .forecast() method (no confidence intervals in statsmodels 0.14)."""
+    n = len(test_df)
+    preds = np.maximum(results.forecast(n).values, 0)
+    # Approximate CI via residual std
+    resid_std = float(np.std(results.resid.dropna()))
+    ci_lower = preds - 1.96 * resid_std
+    ci_upper = preds + 1.96 * resid_std
+    return preds, np.column_stack([ci_lower, ci_upper])
+
+
+def ets_forward_forecast(results, horizon=FORECAST_HORIZON):
+    preds = np.maximum(results.forecast(horizon).values, 0)
+    resid_std = float(np.std(results.resid.dropna()))
+    ci_lower = preds - 1.96 * resid_std
+    ci_upper = preds + 1.96 * resid_std
+    return preds, np.column_stack([ci_lower, ci_upper])
+
+
+# -- Random Forest (sklearn, no install needed) ---------------------------------
+
+def train_rf(train_df):
+    from sklearn.ensemble import RandomForestRegressor
+    feature_cols = [c for c in train_df.columns if c not in ("precip", "day_of_year", "month", "year")]
+    X, y = train_df[feature_cols].values, train_df["precip"].values
+    model = RandomForestRegressor(
+        n_estimators=200, max_depth=10, random_state=42, n_jobs=-1,
+        min_samples_split=5, min_samples_leaf=2,
+    )
+    model.fit(X, y)
+    return model, feature_cols
+
+
+def forecast_rf(model, feature_cols, test_df):
+    preds = np.maximum(model.predict(test_df[feature_cols].values), 0)
+    return preds
+
+
+# -- Transformer models (conditional, requires torch + transformers) ------------
+
+_TRANSFORMER_AVAILABLE = False
+_TRANSFORMER_ERROR = ""
+
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+try:
+    from transformers import TimeSeriesTransformerForPrediction
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
+if _HAS_TORCH and _HAS_TRANSFORMERS:
+    _TRANSFORMER_AVAILABLE = True
+else:
+    _LSTM_ERROR += f"\n  Transformers skipped: torch={'OK' if _HAS_TORCH else 'MISSING'}, transformers={'OK' if _HAS_TRANSFORMERS else 'MISSING'}"
+
+
+def train_timeseries_transformer(train_df, horizon=FORECAST_HORIZON, past_length=30):
+    """Train HuggingFace TimeSeriesTransformerForPrediction.
+
+    Uses only the 'precip' target channel (no exogenous input).
+    Model learns temporal patterns from the last `past_length` days.
+    """
+    if not _TRANSFORMER_AVAILABLE:
+        raise RuntimeError("TimeSeriesTransformer requires torch + transformers. Install with: pip install torch transformers")
+
+    feature_cols = [c for c in train_df.columns if c not in ("precip", "day_of_year", "month", "year")]
+    X_raw = train_df[feature_cols].values
+    y_raw = train_df["precip"].values
+
+    # Scale features
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw)
+
+    # Build dataset: each sample is (past_length of features, horizon of target)
+    X_dataset, y_dataset = [], []
+    for i in range(past_length, len(X_scaled) - horizon + 1):
+        X_dataset.append(X_scaled[i - past_length:i])
+        y_dataset.append(y_raw[i:i + horizon])
+
+    X_tensor = torch.tensor(np.array(X_dataset), dtype=torch.float32)
+    y_tensor = torch.tensor(np.array(y_dataset), dtype=torch.float32)
+
+    # Build model
+    model = TimeSeriesTransformerForPrediction.from_pretrained(
+        "facebook/timeseries_transformer",
+        past_length=past_length,
+        prediction_length=horizon,
+        num_output_samples=1,  # single point forecast
+    )
+
+    # Train with a simple loop (HF API wraps it)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model.train()
+    for epoch in range(10):
+        total_loss = 0.0
+        n_batches = 0
+        for batch_X, batch_y in zip(X_tensor.chunk(64), y_tensor.chunk(64)):
+            optimizer.zero_grad()
+            output = model(batch_X)
+            loss = ((output.prediction_inputs[0] - batch_y) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        print(f"    Transformer epoch {epoch+1}/10 — loss: {total_loss/n_batches:.4f}")
+
+    return model, feature_cols, scaler
+
+
+def forecast_timeseries_transformer(model, feature_cols, scaler, df, horizon=FORECAST_HORIZON, past_length=30):
+    """Generate horizon-step forecast using the trained transformer."""
+    recent = df[feature_cols].values[-past_length:]
+    recent = scaler.transform(recent.reshape(1, -1))
+    x = torch.tensor(recent, dtype=torch.float32)
+    model.eval()
+    with torch.no_grad():
+        output = model(x)
+    pred = output.prediction_inputs[0].numpy().flatten()
+    return np.maximum(pred, 0)
+
+
+# -- TimesFM (Google, optional) -------------------------------------------------
+
+_TIMESFM_AVAILABLE = False
+_TIMESFM_ERROR = ""
+
+try:
+    import timesfm
+    _TIMESFM_AVAILABLE = True
+except ImportError as e:
+    _TIMESFM_ERROR = str(e)
+
+
+def train_timesfm(train_df, horizon=FORECAST_HORIZON):
+    """Train Google's TimesFM model. Returns (forecast_fn, context_array)."""
+    if not _TIMESFM_AVAILABLE:
+        raise RuntimeError(f"TimesFM not available: {_TIMESFM_ERROR}. Install: pip install timesfm")
+    # TimesFM works on raw time series; we pass the full training series
+    context = train_df["precip"].values.astype(np.float32)
+    return context
+
+
+def forecast_timesfm(context_array, horizon=FORECAST_HORIZON):
+    """Use TimesFM to predict next `horizon` steps."""
+    import timesfm
+    tfm = timesfm.TimesFm(
+        context_len=128,
+        horizon_len=horizon,
+        input_patch_len=32,
+        output_patch_len=16,
+        num_layers=8,
+        model_dims=512,
+        backend="cpu",
+    )
+    tfm.load_from_checkpoint(repo_id="google/timesfm-1.0-200m")
+    forecast_input = timesfm.Freq2DfFreq({"D": timesfm.PandasDataSource("daily")})
+    _, point_forecasts, _ = tfm.forecast(
+        [context_array],
+        freq=[forecast_input],
+    )
+    return np.maximum(point_forecasts[0], 0)
+
+
 # -- evaluation ----------------------------------------------------------------
 
 def evaluate(y_true, y_pred, name):
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae = float(mean_absolute_error(y_true, y_pred))
     return {"model": name, "RMSE": round(rmse, 4), "MAE": round(mae, 4)}
+
+
+def backtest_last_n_days(df, n=7, offset=0):
+    """Walk-forward backtest: train on data up to *(len - n - offset)*, predict next *n* days.
+
+    Parameters
+    ----------
+    df : DataFrame with 'precip' column
+    n : int — size of backtest window in days (default 7)
+    offset : int — how many days before the end to start the window.
+        offset=0  → last n days of data
+        offset=7  → n days ending 7 days before the end (skips trailing missing data)
+
+    Returns a dict with predicted/actual arrays and metrics for each model.
+    Returns None if not enough data.
+    """
+    trim = n + offset
+    if len(df) < 365 + trim:
+        return None
+    feat = build_features(df)
+    train_end = len(feat) - trim
+    train_df = feat.iloc[:train_end]
+    test_df = feat.iloc[train_end:train_end + n]
+    if len(test_df) != n:
+        return None
+    # SARIMAX
+    sarima_res = sarima_fit(train_df)
+    sarima_pred, sarima_ci = sarima_test_predictions(sarima_res, test_df)
+    sarima_metrics = evaluate(test_df["precip"].values, sarima_pred, "SARIMAX")
+    # XGBoost
+    xgb_model, feat_cols = train_xgboost(train_df)
+    xgb_pred = forecast_xgboost(xgb_model, feat_cols, test_df)
+    xgb_metrics = evaluate(test_df["precip"].values, xgb_pred, "XGBoost")
+    # Actual values and dates
+    actual = test_df["precip"].values
+    dates = df.index[train_end:train_end + n]
+    return {
+        "dates": dates,
+        "actual": actual,
+        "sarima_pred": sarima_pred,
+        "sarima_ci": sarima_ci,
+        "sarima_metrics": sarima_metrics,
+        "xgb_pred": xgb_pred,
+        "xgb_metrics": xgb_metrics,
+        "feat_cols": feat_cols,
+    }
 
 
 def save_pipeline(sarima_res, xgb_model, feat_cols, meta, model_path="data/processed/precipitation_model.joblib"):
