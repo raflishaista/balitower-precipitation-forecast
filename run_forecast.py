@@ -33,9 +33,10 @@ from utils.precipitation_models import (
     train_histgb, forecast_histgb,
     ets_fit, ets_test_predictions, ets_forward_forecast,
     train_rf, forecast_rf,
+    forecast_patchtst, forecast_timesfm, forecast_tabicl,
     _LSTM_AVAILABLE, _LSTM_ERROR,
     _TRANSFORMER_AVAILABLE,
-    _TIMESFM_AVAILABLE,
+    _TABICL_AVAILABLE,
     evaluate,
     save_pipeline,
     backtest_last_n_days,
@@ -60,8 +61,9 @@ MODEL_REGISTRY = {
     "rf":       {"train": train_rf,              "test": forecast_rf,
                  "forecast": None},
     "lstm":     {"available": "_LSTM_AVAILABLE"},
-    "tsf":      {"available": "_TRANSFORMER_AVAILABLE"},
-    "timesfm":  {"available": "_TIMESFM_AVAILABLE"},
+    "patchtst": {"available": "_TRANSFORMER_AVAILABLE"},
+    "timesfm":  {"available": "_TRANSFORMER_AVAILABLE"},
+    "tabicl":   {"available": "_TABICL_AVAILABLE"},
 }
 
 
@@ -175,9 +177,10 @@ def run(city, years, include_lstm=True, save_json_path=None, models=None):
         if include_lstm and _LSTM_AVAILABLE:
             models.append("lstm")
         if _TRANSFORMER_AVAILABLE:
-            models.append("tsf")
-        if _TIMESFM_AVAILABLE:
+            models.append("patchtst")
             models.append("timesfm")
+        if _TABICL_AVAILABLE:
+            models.append("tabicl")
 
     print(f"\n{'='*60}")
     print(f"  PRECIPITATION FORECAST — {city.upper()}")
@@ -289,36 +292,88 @@ def run(city, years, include_lstm=True, save_json_path=None, models=None):
                 all_model_metrics["lstm"] = metrics
                 print(f"  {metrics}")
 
-            elif name == "tsf":
-                from utils.precipitation_models import (
-                    train_timeseries_transformer, forecast_timeseries_transformer,
-                )
-                model, feat_cols, scaler = train_timeseries_transformer(train_df,
-                                                                          horizon=FORECAST_HORIZON)
-                pred = forecast_timeseries_transformer(model, feat_cols, scaler, train_df,
-                                                        horizon=FORECAST_HORIZON)
-                # Evaluate on last few train samples (approximate test)
-                n_eval = min(FORECAST_HORIZON * 5, len(train_df) - 30)
-                pred_eval = forecast_timeseries_transformer(model, feat_cols, scaler,
-                                                             train_df.tail(n_eval + 30),
-                                                             horizon=FORECAST_HORIZON)
-                actual_eval = train_df["precip"].values[-n_eval:]
-                metrics = evaluate(actual_eval, pred_eval[:n_eval], "TsF")
-                all_model_states["tsf"] = (model, feat_cols, scaler)
-                all_model_preds["tsf"] = pred_eval
-                all_model_metrics["tsf"] = metrics
+            elif name == "patchtst":
+                series = train_df["precip"].values.astype(np.float32)
+                n_test = len(test_df)
+                # Align: predict forward from each training point, collect last n_test predictions
+                context_len = 128
+                preds_eval, actual_eval = [], []
+                for offset in range(n_test):
+                    idx = len(series) - n_test + offset
+                    if idx < context_len:
+                        continue
+                    p = forecast_patchtst(series[:idx], horizon=FORECAST_HORIZON)
+                    preds_eval.extend(p.tolist())
+                    actual_eval.extend(series[idx:idx+FORECAST_HORIZON].tolist())
+                preds_eval = np.array(preds_eval)
+                actual_eval = np.array(actual_eval)
+                # Average over horizon steps for per-day metrics
+                n_pts = preds_eval.size // FORECAST_HORIZON
+                preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                preds_avg = preds_reshaped.mean(axis=1)
+                actual_avg = actual_reshaped.mean(axis=1)
+                metrics = evaluate(actual_avg, preds_avg, "PatchTST")
+                # Forward forecast from end of training
+                fc = forecast_patchtst(series, horizon=FORECAST_HORIZON)
+                # Pad to match test set length for plotting
+                pred_full = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
+                all_model_preds["patchtst"] = pred_full
+                all_model_metrics["patchtst"] = metrics
                 print(f"  {metrics}")
 
             elif name == "timesfm":
-                from utils.precipitation_models import train_timesfm, forecast_timesfm
-                context = train_timesfm(train_df, horizon=FORECAST_HORIZON)
-                pred = forecast_timesfm(context, horizon=FORECAST_HORIZON)
-                n_eval = min(FORECAST_HORIZON * 5, len(context) - FORECAST_HORIZON)
-                actual_eval = context[-n_eval:]
-                metrics = evaluate(actual_eval, pred[:n_eval], "TimesFM")
-                all_model_states["timesfm"] = context
-                all_model_preds["timesfm"] = pred
+                series = train_df["precip"].values.astype(np.float32)
+                n_test = len(test_df)
+                context_len = 256
+                preds_eval, actual_eval = [], []
+                for offset in range(n_test):
+                    idx = len(series) - n_test + offset
+                    if idx < context_len:
+                        continue
+                    p = forecast_timesfm(series[:idx], horizon=FORECAST_HORIZON)
+                    preds_eval.extend(p.tolist())
+                    actual_eval.extend(series[idx:idx+FORECAST_HORIZON].tolist())
+                preds_eval = np.array(preds_eval)
+                actual_eval = np.array(actual_eval)
+                n_pts = preds_eval.size // FORECAST_HORIZON
+                preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                preds_avg = preds_reshaped.mean(axis=1)
+                actual_avg = actual_reshaped.mean(axis=1)
+                metrics = evaluate(actual_avg, preds_avg, "TimesFM")
+                fc = forecast_timesfm(series, horizon=FORECAST_HORIZON)
+                pred_full = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
+                all_model_preds["timesfm"] = pred_full
                 all_model_metrics["timesfm"] = metrics
+                print(f"  {metrics}")
+
+            elif name == "tabicl":
+                from utils.precipitation_models import forecast_tabicl
+                series = train_df["precip"].values.astype(np.float32)
+                n_test = len(test_df)
+                preds_eval, actual_eval = [], []
+                # Rolling eval over last n_test points
+                for offset in range(n_test):
+                    idx = len(series) - n_test + offset
+                    if idx < 64:
+                        continue
+                    df_chunk = train_df.iloc[:idx+1].copy()
+                    p = forecast_tabicl(df_chunk, horizon=FORECAST_HORIZON)
+                    preds_eval.extend(p.tolist())
+                    actual_eval.extend(series[idx:idx+FORECAST_HORIZON].tolist())
+                preds_eval = np.array(preds_eval)
+                actual_eval = np.array(actual_eval)
+                n_pts = preds_eval.size // FORECAST_HORIZON
+                preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                preds_avg = preds_reshaped.mean(axis=1)
+                actual_avg = actual_reshaped.mean(axis=1)
+                metrics = evaluate(actual_avg, preds_avg, "TabICL")
+                fc = forecast_tabicl(train_df, horizon=FORECAST_HORIZON)
+                pred_full = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
+                all_model_preds["tabicl"] = pred_full
+                all_model_metrics["tabicl"] = metrics
                 print(f"  {metrics}")
 
         except Exception as e:
@@ -395,7 +450,7 @@ def main():
     parser.add_argument("--no-lstm", action="store_true", help="Skip LSTM model")
     parser.add_argument("--models", nargs="+",
                         choices=list(MODEL_REGISTRY.keys()),
-                        help="Models to run (default: sarima xgb hgb ets rf [+lstm/tsf/timesfm if available])")
+                        help="Models to run (default: sarima xgb hgb ets rf [+lstm/patchtst/timesfm/tabicl if available])")
     parser.add_argument("--backtest-offset", type=int, default=14,
                         help="Days before end to start backtest window (default: 14)")
     args = parser.parse_args()
@@ -465,40 +520,66 @@ def main():
                     all_states["rf"] = (model, feat_cols)
                     all_preds["rf"] = pred
                     all_metrics["rf"] = metrics
-                elif name == "tsf":
-                    from utils.precipitation_models import (
-                        train_timeseries_transformer, forecast_timeseries_transformer,
-                    )
-                    model, feat_cols, scaler = train_timeseries_transformer(train_df,
-                                                                             horizon=FORECAST_HORIZON)
-                    n_eval = min(FORECAST_HORIZON * 5, len(train_df) - 30)
-                    pred_eval = forecast_timeseries_transformer(model, feat_cols, scaler,
-                                                                 train_df.tail(n_eval + 30),
-                                                                 horizon=FORECAST_HORIZON)
-                    actual_eval = train_df["precip"].values[-n_eval:]
-                    metrics = evaluate(actual_eval, pred_eval[:n_eval], "TsF")
-                    # 7-day forward forecast using last past_length days of full data
-                    past_length = 30
-                    future_features = feat_df[feat_cols].tail(past_length + FORECAST_HORIZON).values
-                    fc_raw = forecast_timeseries_transformer(model, feat_cols, scaler,
-                                                             feat_df.tail(past_length + FORECAST_HORIZON))
-                    fc_val = np.maximum(fc_raw[-FORECAST_HORIZON:], 0)
-                    all_states["tsf"] = (model, feat_cols, scaler)
-                    all_preds["tsf"] = pred_eval
-                    all_metrics["tsf"] = metrics
-                    forecast_preds["tsf"] = fc_val
+                elif name == "patchtst":
+                    series = train_df["precip"].values.astype(np.float32)
+                    n_test = len(test_df)
+                    eval_start = max(0, len(series) - 35)
+                    preds_eval, actual_eval = [], []
+                    for i in range(eval_start, len(series) - FORECAST_HORIZON):
+                        p = forecast_patchtst(series[:i+1], horizon=FORECAST_HORIZON)
+                        preds_eval.extend(p.tolist())
+                        actual_eval.extend(series[i+1:i+1+FORECAST_HORIZON].tolist())
+                    preds_eval = np.array(preds_eval)
+                    actual_eval = np.array(actual_eval)
+                    n_pts = preds_eval.size // FORECAST_HORIZON
+                    preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    metrics = evaluate(actual_reshaped.mean(axis=1), preds_reshaped.mean(axis=1), "PatchTST")
+                    fc = forecast_patchtst(series, horizon=FORECAST_HORIZON)
+                    all_preds["patchtst"] = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
+                    all_metrics["patchtst"] = metrics
+                    forecast_preds["patchtst"] = fc
                     print(f"  {metrics}")
                 elif name == "timesfm":
-                    from utils.precipitation_models import train_timesfm, forecast_timesfm
-                    context = train_timesfm(train_df, horizon=FORECAST_HORIZON)
-                    pred = forecast_timesfm(context, horizon=FORECAST_HORIZON)
-                    n_eval = min(FORECAST_HORIZON * 5, len(context) - FORECAST_HORIZON)
-                    actual_eval = context[-n_eval:]
-                    metrics = evaluate(actual_eval, pred[:n_eval], "TimesFM")
-                    all_states["timesfm"] = context
-                    all_preds["timesfm"] = pred
+                    series = train_df["precip"].values.astype(np.float32)
+                    n_test = len(test_df)
+                    eval_start = max(0, len(series) - 35)
+                    preds_eval, actual_eval = [], []
+                    for i in range(eval_start, len(series) - FORECAST_HORIZON):
+                        p = forecast_timesfm(series[:i+1], horizon=FORECAST_HORIZON)
+                        preds_eval.extend(p.tolist())
+                        actual_eval.extend(series[i+1:i+1+FORECAST_HORIZON].tolist())
+                    preds_eval = np.array(preds_eval)
+                    actual_eval = np.array(actual_eval)
+                    n_pts = preds_eval.size // FORECAST_HORIZON
+                    preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    metrics = evaluate(actual_reshaped.mean(axis=1), preds_reshaped.mean(axis=1), "TimesFM")
+                    fc = forecast_timesfm(series, horizon=FORECAST_HORIZON)
+                    all_preds["timesfm"] = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
                     all_metrics["timesfm"] = metrics
-                    forecast_preds["timesfm"] = np.maximum(pred, 0)
+                    forecast_preds["timesfm"] = fc
+                    print(f"  {metrics}")
+                elif name == "tabicl":
+                    from utils.precipitation_models import forecast_tabicl
+                    series = train_df["precip"].values.astype(np.float32)
+                    n_test = len(test_df)
+                    eval_start = max(0, len(series) - 35)
+                    preds_eval, actual_eval = [], []
+                    for i in range(eval_start, len(series) - FORECAST_HORIZON):
+                        p = forecast_tabicl(train_df.iloc[:i+1], horizon=FORECAST_HORIZON)
+                        preds_eval.extend(p.tolist())
+                        actual_eval.extend(series[i+1:i+1+FORECAST_HORIZON].tolist())
+                    preds_eval = np.array(preds_eval)
+                    actual_eval = np.array(actual_eval)
+                    n_pts = preds_eval.size // FORECAST_HORIZON
+                    preds_reshaped = preds_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    actual_reshaped = actual_eval[:n_pts * FORECAST_HORIZON].reshape(n_pts, FORECAST_HORIZON)
+                    metrics = evaluate(actual_reshaped.mean(axis=1), preds_reshaped.mean(axis=1), "TabICL")
+                    fc = forecast_tabicl(train_df, horizon=FORECAST_HORIZON)
+                    all_preds["tabicl"] = np.tile(fc, int(np.ceil(n_test / FORECAST_HORIZON)))[:n_test]
+                    all_metrics["tabicl"] = metrics
+                    forecast_preds["tabicl"] = fc
                     print(f"  {metrics}")
                 else:
                     print(f"  [SKIP] {name} — not implemented in --input mode")

@@ -389,6 +389,12 @@ def forecast_rf(model, feature_cols, test_df):
 
 _TRANSFORMER_AVAILABLE = False
 _TRANSFORMER_ERROR = ""
+_PATCHTST_AVAILABLE = False
+_PATCHTST_ERROR = ""
+_TIMESFM_AVAILABLE = False
+_TIMESFM_ERROR = ""
+_TABICL_AVAILABLE = False
+_TABICL_ERROR = ""
 
 try:
     import torch
@@ -397,7 +403,7 @@ except ImportError:
     _HAS_TORCH = False
 
 try:
-    from transformers import TimeSeriesTransformerForPrediction
+    from transformers import PatchTSTForPrediction, TimesFm2_5ModelForPrediction
     _HAS_TRANSFORMERS = True
 except ImportError:
     _HAS_TRANSFORMERS = False
@@ -407,113 +413,111 @@ if _HAS_TORCH and _HAS_TRANSFORMERS:
 else:
     _LSTM_ERROR += f"\n  Transformers skipped: torch={'OK' if _HAS_TORCH else 'MISSING'}, transformers={'OK' if _HAS_TRANSFORMERS else 'MISSING'}"
 
-
-def train_timeseries_transformer(train_df, horizon=FORECAST_HORIZON, past_length=30):
-    """Train HuggingFace TimeSeriesTransformerForPrediction.
-
-    Uses only the 'precip' target channel (no exogenous input).
-    Model learns temporal patterns from the last `past_length` days.
-    """
-    if not _TRANSFORMER_AVAILABLE:
-        raise RuntimeError("TimeSeriesTransformer requires torch + transformers. Install with: pip install torch transformers")
-
-    feature_cols = [c for c in train_df.columns if c not in ("precip", "day_of_year", "month", "year")]
-    X_raw = train_df[feature_cols].values
-    y_raw = train_df["precip"].values
-
-    # Scale features
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
-
-    # Build dataset: each sample is (past_length of features, horizon of target)
-    X_dataset, y_dataset = [], []
-    for i in range(past_length, len(X_scaled) - horizon + 1):
-        X_dataset.append(X_scaled[i - past_length:i])
-        y_dataset.append(y_raw[i:i + horizon])
-
-    X_tensor = torch.tensor(np.array(X_dataset), dtype=torch.float32)
-    y_tensor = torch.tensor(np.array(y_dataset), dtype=torch.float32)
-
-    # Build model
-    model = TimeSeriesTransformerForPrediction.from_pretrained(
-        "facebook/timeseries_transformer",
-        past_length=past_length,
-        prediction_length=horizon,
-        num_output_samples=1,  # single point forecast
-    )
-
-    # Train with a simple loop (HF API wraps it)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    model.train()
-    for epoch in range(10):
-        total_loss = 0.0
-        n_batches = 0
-        for batch_X, batch_y in zip(X_tensor.chunk(64), y_tensor.chunk(64)):
-            optimizer.zero_grad()
-            output = model(batch_X)
-            loss = ((output.prediction_inputs[0] - batch_y) ** 2).mean()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
-        print(f"    Transformer epoch {epoch+1}/10 — loss: {total_loss/n_batches:.4f}")
-
-    return model, feature_cols, scaler
-
-
-def forecast_timeseries_transformer(model, feature_cols, scaler, df, horizon=FORECAST_HORIZON, past_length=30):
-    """Generate horizon-step forecast using the trained transformer."""
-    recent = df[feature_cols].values[-past_length:]
-    recent = scaler.transform(recent.reshape(1, -1))
-    x = torch.tensor(recent, dtype=torch.float32)
-    model.eval()
-    with torch.no_grad():
-        output = model(x)
-    pred = output.prediction_inputs[0].numpy().flatten()
-    return np.maximum(pred, 0)
-
-
-# -- TimesFM (Google, optional) -------------------------------------------------
-
-_TIMESFM_AVAILABLE = False
-_TIMESFM_ERROR = ""
-
 try:
-    import timesfm
-    _TIMESFM_AVAILABLE = True
+    import tabicl
+    _TABICL_AVAILABLE = True
 except ImportError as e:
-    _TIMESFM_ERROR = str(e)
+    _TABICL_ERROR = str(e)
 
 
-def train_timesfm(train_df, horizon=FORECAST_HORIZON):
-    """Train Google's TimesFM model. Returns (forecast_fn, context_array)."""
-    if not _TIMESFM_AVAILABLE:
-        raise RuntimeError(f"TimesFM not available: {_TIMESFM_ERROR}. Install: pip install timesfm")
-    # TimesFM works on raw time series; we pass the full training series
-    context = train_df["precip"].values.astype(np.float32)
-    return context
+# ---- PatchTST (IBM) — zero-shot pretrained, no fine-tuning needed -------------
+
+_PATCHTST_MODEL_ID = "ibm-research/patchtst-etth1-pretrain"
+_PATCHTST_CONTEXT = 128
+_PATCHTST_PRED_LEN = 7
 
 
-def forecast_timesfm(context_array, horizon=FORECAST_HORIZON):
-    """Use TimesFM to predict next `horizon` steps."""
-    import timesfm
-    tfm = timesfm.TimesFm(
-        context_len=128,
-        horizon_len=horizon,
-        input_patch_len=32,
-        output_patch_len=16,
-        num_layers=8,
-        model_dims=512,
-        backend="cpu",
-    )
-    tfm.load_from_checkpoint(repo_id="google/timesfm-1.0-200m")
-    forecast_input = timesfm.Freq2DfFreq({"D": timesfm.PandasDataSource("daily")})
-    _, point_forecasts, _ = tfm.forecast(
-        [context_array],
-        freq=[forecast_input],
-    )
-    return np.maximum(point_forecasts[0], 0)
+def _get_patchtst_model():
+    """Load PatchTST for single-channel precipitation forecasting."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(_PATCHTST_MODEL_ID)
+    cfg.num_input_channels = 1
+    cfg.context_length = _PATCHTST_CONTEXT
+    cfg.prediction_length = _PATCHTST_PRED_LEN
+    cfg.mask_ratio = 0.0
+    model = PatchTSTForPrediction.from_pretrained(_PATCHTST_MODEL_ID, config=cfg)
+    model.eval()
+    return model
+
+
+def forecast_patchtst(series, horizon=_PATCHTST_PRED_LEN):
+    """Run PatchTST zero-shot forecast on a 1-D precip series.
+
+    Parameters
+    ----------
+    series : np.ndarray  — daily precipitation values (1-D)
+    horizon : int
+    Returns
+    -------
+    np.ndarray of shape (horizon,) with predicted precipitation, clipped >= 0.
+    """
+    import torch
+    x = torch.tensor(series[-_PATCHTST_CONTEXT:].astype(np.float32), dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+    with torch.no_grad():
+        out = _get_patchtst_model()(past_values=x)
+    preds = out.prediction_outputs.squeeze().numpy()[:horizon]
+    return np.maximum(preds, 0)
+
+
+# ---- TimesFM 2.5 (Google) — zero-shot pretrained ----------------------------
+
+_TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-transformers"
+_TIMESFM_CONTEXT = 256
+_TIMESFM_HORIZON = 128
+
+
+def _get_timesfm_model():
+    """Load TimesFM 2.5 for single-series forecasting."""
+    model = TimesFm2_5ModelForPrediction.from_pretrained(_TIMESFM_MODEL_ID)
+    model.eval()
+    return model
+
+
+def forecast_timesfm(series, horizon=FORECAST_HORIZON, context_len=_TIMESFM_CONTEXT):
+    """Run TimesFM zero-shot forecast on a 1-D precip series.
+
+    Parameters
+    ----------
+    series : np.ndarray  — daily precipitation values (1-D)
+    horizon : int — number of future steps (must be <= model's horizon_length)
+    context_len : int — how many past steps to use
+    Returns
+    -------
+    np.ndarray of shape (horizon,) with predicted precipitation, clipped >= 0.
+    """
+    import torch
+    x = torch.tensor(series[-context_len:].astype(np.float32), dtype=torch.float32)
+    model = _get_timesfm_model()
+    with torch.no_grad():
+        out = model(past_values=[x])
+    preds = out.mean_predictions.squeeze().numpy()[:horizon]
+    return np.maximum(preds, 0)
+
+
+# ---- TabICL (Inria/SODA) — in-context learning forecaster --------------------
+
+def forecast_tabicl(train_df, horizon=FORECAST_HORIZON, context_len=512):
+    """Run TabICL zero-shot forecast using in-context learning.
+
+    TabICL treats the historical series as a few-shot context and
+    predicts the next `horizon` steps. Requires `pip install tabicl[forecast]`.
+    """
+    if not _TABICL_AVAILABLE:
+        raise RuntimeError(f"TabICL not available: {_TABICL_ERROR}")
+    from tabicl import TabICLForecaster
+    from tabicl.forecast import TimeSeriesDataFrame
+    from tabicl.forecast._preprocessing import build_horizon
+
+    prec = train_df["precip"].values.astype(float)
+    idx = pd.date_range(end=train_df.index[-1], periods=len(prec), freq="D")
+    df = pd.DataFrame({"item_id": [0] * len(prec), "timestamp": idx, "target": prec})
+    ts_df = TimeSeriesDataFrame(df)
+
+    forecaster = TabICLForecaster(max_context_length=context_len)
+    future_df = build_horizon(ts_df, prediction_length=horizon)
+    result = forecaster.predict(ts_df, future_df)
+    preds = result["target"].values
+    return np.maximum(preds, 0)
 
 
 # -- evaluation ----------------------------------------------------------------
