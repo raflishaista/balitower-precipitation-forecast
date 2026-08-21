@@ -224,7 +224,7 @@ A natural-language forecasting frontend powered by [Nemotron-35](https://hugging
 
 | Env Var | Default | Description |
 |---|---|---|
-| `LLM_KEY` | `KEY_REMOVED` | API bearer token |
+| `LLM_KEY` | `` | API bearer token |
 | `LLM_URL` | `http://10.7.1.21/` | OpenAI-compatible endpoint |
 | `LLM_MODEL` | `nemotron-35` | Model name |
 | `LLM_MAX_TOKENS` | `1024` | Max output tokens |
