@@ -225,7 +225,7 @@ def sarima_test_predictions(results, test_df):
     exog_cols = getattr(results, '_exog_cols', ["doy_sin", "doy_cos"])
     test_exog = test_df[exog_cols].values if exog_cols else None
     pred = results.get_forecast(steps=len(test_df), exog=test_exog)
-    preds = pred.predicted_mean.values
+    preds = np.asarray(pred.predicted_mean)[:horizon]
     preds = np.maximum(preds, 0)
     return preds, pred.conf_int().values
 
@@ -234,7 +234,7 @@ def sarima_forward_forecast(results, feat_df, horizon=FORECAST_HORIZON):
     exog_cols = getattr(results, '_exog_cols', ["doy_sin", "doy_cos"])
     exog_tail = feat_df[exog_cols].tail(horizon).values if exog_cols else None
     pred = results.get_forecast(steps=horizon, exog=exog_tail)
-    preds = pred.predicted_mean.values
+    preds = np.asarray(pred.predicted_mean)[:horizon]
     preds = np.maximum(preds, 0)
     return preds, pred.conf_int().values
 

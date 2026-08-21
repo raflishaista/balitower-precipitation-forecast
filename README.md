@@ -216,6 +216,92 @@ python stocks.py
 
 ---
 
+## 🤖 LLM Orchestrator (`run_orchestrator.py`)
+
+A natural-language forecasting frontend powered by [Nemotron-35](https://huggingface.co/nvidia/Nemotron-35). Parse any English request and get multi-model forecasts automatically.
+
+### Configuration
+
+| Env Var | Default | Description |
+|---|---|---|
+| `LLM_KEY` | `KEY_REMOVED` | API bearer token |
+| `LLM_URL` | `http://10.7.1.21/` | OpenAI-compatible endpoint |
+| `LLM_MODEL` | `nemotron-35` | Model name |
+| `LLM_MAX_TOKENS` | `1024` | Max output tokens |
+
+### CLI Usage
+
+```bash
+# Full pipeline: parse + forecast
+python run_orchestrator.py --input "predict rainfall in Jakarta for the next 7 days"
+
+# Dry-run: only show parsed intent (no forecasting)
+python run_orchestrator.py --input "forecast AAPL stock price for the next 5 days" --dry-run
+
+# Aliases
+python run_orchestrator.py -i "how much rain will London get next week"
+```
+
+### What Gets Parsed
+
+The LLM extracts these fields from your request:
+
+| Field | Type | Example |
+|---|---|---|
+| `domain` | `"weather"` or `"stocks"` | `"weather"` |
+| `target` | short phrase | `"rainfall"` |
+| `location_or_symbol` | city / ticker | `"Jakarta"` |
+| `horizon` | int (1–30) | `7` |
+| `data_source_hint` | source tag | `"NASA_POWER"` |
+| `note` | extra context | `"next week"` |
+
+### Models Available
+
+**Weather** (precipitation): SARIMAX · XGBoost · HistGradientBoosting · ETS · Random Forest · PatchTST · TimesFM · TabICL
+
+**Stocks** (close price): SARIMAX · XGBoost · HistGradientBoosting · ETS · Random Forest
+
+Missing dependencies (TensorFlow, transformers, histboost) are skipped gracefully.
+
+### Outputs
+
+Forecasts are saved as JSON in `outputs/orchestrator/`:
+
+```json
+{
+  "city": "Jakarta",
+  "forecast_dates": ["2025-01-24", "2025-01-25", "..."],
+  "models": {
+    "tabicl": {"predictions": [9.17, 10.80, ...], "metrics": {"model": "TabICL", "RMSE": 8.84, "MAE": 6.98}},
+    "timesfm": {"predictions": [5.96, 7.02, ...], "metrics": {...}},
+    "sarima": {"predictions": [...], "metrics": {...}}
+  }
+}
+```
+
+### Prompt Template
+
+The orchestrator uses this system prompt (stored in `run_orchestrator.py`):
+
+```
+You are a forecasting orchestration agent. Parse the user request below
+and output ONLY valid JSON — no explanation, no markdown, just the raw
+JSON object. Required fields: domain, target, location_or_symbol,
+horizon, data_source_hint, note.
+```
+
+Example interaction:
+
+```
+User: "predict rainfall in Jakarta for the next 7 days"
+LLM → {"domain":"weather","target":"rainfall","location_or_symbol":"Jakarta",
+       "horizon":7,"data_source_hint":"NASA_POWER","note":""}
+→ Runs SARIMAX, XGBoost, RF, PatchTST, TimesFM, TabICL on Jakarta 10y data
+→ Saves: outputs/orchestrator/forecast_Jakarta.json
+```
+
+---
+
 ## 📄 License & Credits
 
 * **Weather data**: [NASA POWER](https://power.larc.nasa.gov) — Daily Point API (1981–present)
