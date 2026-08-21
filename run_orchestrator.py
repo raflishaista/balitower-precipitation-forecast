@@ -21,7 +21,7 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 # ── LLM config ──────────────────────────────────────────────────────────────
-LLM_KEY = os.environ.get("LLM_KEY", "KEY_REMOVED")
+LLM_KEY = os.environ.get("LLM_KEY", "")
 LLM_URL = os.environ.get("LLM_URL", "http://10.7.1.21/")
 LLM_MODEL = "nemotron-35"
 LLM_MAX_TOKENS = 1024

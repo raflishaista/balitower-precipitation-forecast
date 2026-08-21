@@ -36,3 +36,6 @@ data/processed/precipitation_model.joblib
 # Optional: generated outputs (commented out by default — outputs ARE committed in this repo)
 # outputs/figures/*.png
 # outputs/predictions/*.json
+# Secrets
+.env
+.env.local
